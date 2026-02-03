@@ -4,7 +4,12 @@
   "description": "scrapes Indian court judgements",
   
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+     "filter": "node ./SC_judgement_scraper/filter_links.js",
+    "scrape": "node ./SC_judgement_scraper/main_scraper.js",
+    "verify": "node ./SC_judgement_scraper/verify_and_recover.js",
+    "full": "npm run filter && npm run scrape",
+    "resume": "npm run scrape"
   },
   "author": "",
   "license": "ISC",
