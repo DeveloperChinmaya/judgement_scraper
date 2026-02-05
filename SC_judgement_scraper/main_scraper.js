@@ -1,419 +1,294 @@
-const axios = require('axios');
-const cheerio = require('cheerio');
-const fs = require('fs');
+const axios = require("axios");
+const cheerio = require("cheerio");
+const fs = require("fs");
+
+/* ============================================================
+   JUDGEMENT SCRAPER – PRODUCTION VERSION
+   - Year-wise JSON storage
+   - Resume support
+   - Atomic writes
+   - Ctrl+C safe
+============================================================ */
 
 class JudgementScraper {
-    constructor() {
-        this.baseURL = 'https://indiankanoon.org';
-        this.delay = 1500; // 2 seconds between requests
-        this.concurrent = 1; // Process one at a time for reliability
-        
-        // Files
-        this.linksFile = 'all_judgement_links_flat.json';
-        this.outputFile = 'judgements_data.json';
-        this.progressFile = 'judgement_scraper_progress.json';
-        
-        // Initialize data structures
-        this.judgementsData = {};
-        this.progress = {
-            year: null,
-            page: null,
-            index: -1,
-            totalProcessed: 0,
-            status: 'idle'
-        };
-        
-        // Initialize axios
-        this.axiosInstance = axios.create({
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Connection': 'keep-alive'
-            },
-            timeout: 60000,
-            maxRedirects: 5
-        });
-        
-        this.allLinks = [];
-        this.currentYearData = null;
+  constructor({ resume = false } = {}) {
+
+    /* ---------- CONFIG ---------- */
+    this.baseURL = "https://indiankanoon.org";
+    this.delay = 1500;
+    this.linksFile = "all_judgement_links_flat.json";
+    this.progressFile = "judgement_scraper_progress.json";
+    this.outputDir = "judgements";
+
+    /* ---------- STATE ---------- */
+    this.currentYear = null;
+    this.currentYearBuffer = [];
+    this.allLinks = [];
+    this.resume = resume;
+
+    this.progress = {
+      year: null,
+      page: null,
+      index: -1,
+      totalProcessed: 0,
+      status: "idle"
+    };
+
+    if (!fs.existsSync(this.outputDir)) {
+      fs.mkdirSync(this.outputDir);
     }
 
-    // Load progress
-    loadProgress() {
-        try {
-            if (fs.existsSync(this.progressFile)) {
-                const data = fs.readFileSync(this.progressFile, 'utf8');
-                this.progress = JSON.parse(data);
-                console.log(`Resuming from: Year ${this.progress.year}, Index ${this.progress.index + 1}`);
-                return true;
-            }
-        } catch (error) {
-            console.log('No progress file found, starting fresh...');
+    this.http = axios.create({
+      timeout: 60000,
+      maxRedirects: 5,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      }
+    });
+  }
+
+  /* ============================================================
+     FILE HELPERS
+  ============================================================ */
+
+  getYearFile(year) {
+    return `${this.outputDir}/${year}.json`;
+  }
+
+  loadYear(year) {
+    const file = this.getYearFile(year);
+
+    if (fs.existsSync(file)) {
+      this.currentYearBuffer = JSON.parse(fs.readFileSync(file, "utf8"));
+    } else {
+      this.currentYearBuffer = [];
+    }
+
+    this.currentYear = year;
+  }
+
+  saveCurrentYear() {
+    if (!this.currentYear) return;
+
+    const file = this.getYearFile(this.currentYear);
+    const tmp = file + ".tmp";
+
+    fs.writeFileSync(tmp, JSON.stringify(this.currentYearBuffer, null, 2));
+    fs.renameSync(tmp, file);
+  }
+
+  saveProgress() {
+    fs.writeFileSync(
+      this.progressFile,
+      JSON.stringify(this.progress, null, 2)
+    );
+  }
+
+  loadProgress() {
+    if (!this.resume) return;
+
+    if (fs.existsSync(this.progressFile)) {
+      this.progress = JSON.parse(
+        fs.readFileSync(this.progressFile, "utf8")
+      );
+
+      console.log(
+        `Resuming at index ${this.progress.index + 1}`
+      );
+    }
+  }
+
+  loadAllLinks() {
+    this.allLinks = JSON.parse(
+      fs.readFileSync(this.linksFile, "utf8")
+    );
+
+    console.log(`Loaded ${this.allLinks.length} links`);
+  }
+
+  /* ============================================================
+     EXTRACTION
+  ============================================================ */
+
+  extractTextWithMetadata(el, $, parent = "text") {
+    const result = [];
+    const title =
+      $(el).attr("title") || $(el).attr("id") || parent;
+
+    const directText = $(el)
+      .contents()
+      .filter(function () {
+        return this.nodeType === 3;
+      })
+      .text()
+      .trim();
+
+    if (directText) {
+      result.push({ type: title, content: directText });
+    }
+
+    $(el)
+      .children()
+      .each((_, child) => {
+        const tag = $(child).prop("tagName").toLowerCase();
+        if (tag === "script" || tag === "style") return;
+
+        const childText = $(child).text().trim();
+        if (!childText) return;
+
+        if (["p", "div", "span", "pre", "blockquote"].includes(tag)) {
+          result.push(
+            ...this.extractTextWithMetadata(child, $, title)
+          );
+        } else {
+          result.push({ type: title, content: childText });
         }
-        return false;
-    }
+      });
 
-    // Save progress
-    saveProgress() {
-        fs.writeFileSync(this.progressFile, JSON.stringify(this.progress, null, 2));
-    }
+    return result;
+  }
 
-    // Load existing judgements data
-    loadJudgementsData() {
-        try {
-            if (fs.existsSync(this.outputFile)) {
-                const data = fs.readFileSync(this.outputFile, 'utf8');
-                this.judgementsData = JSON.parse(data);
-                console.log(`Loaded ${Object.keys(this.judgementsData).length} years of existing data`);
-                return true;
-            }
-        } catch (error) {
-            this.judgementsData = {};
-        }
-        return false;
-    }
+  extractJudgement(html, url) {
+    const $ = cheerio.load(html);
 
-    // Save judgements data
-    saveJudgementsData() {
-        fs.writeFileSync(this.outputFile, JSON.stringify(this.judgementsData, null, 2));
-    }
+    const result = {
+      title: "",
+      texts: [],
+      url,
+      timestamp: new Date().toISOString()
+    };
 
-    // Load all links
-    loadAllLinks() {
-        try {
-            const data = fs.readFileSync(this.linksFile, 'utf8');
-            this.allLinks = JSON.parse(data);
-            console.log(`Loaded ${this.allLinks.length} judgement links`);
-            return true;
-        } catch (error) {
-            console.error('Error loading links file:', error.message);
-            return false;
-        }
-    }
+    const div = $("div.judgments");
+    if (!div.length) return result;
 
-    // Clean incomplete judgement if exists at resume position
-    cleanIncompleteJudgement() {
-        if (this.progress.year && this.progress.index >= 0) {
-            const yearStr = this.progress.year.toString();
-            if (this.judgementsData[yearStr] && this.judgementsData[yearStr].length > 0) {
-                // Check if last judgement is incomplete (no texts or empty)
-                const lastIndex = this.judgementsData[yearStr].length - 1;
-                const lastJudgement = this.judgementsData[yearStr][lastIndex];
-                
-                if (!lastJudgement.texts || lastJudgement.texts.length === 0) {
-                    console.log('Removing incomplete judgement...');
-                    this.judgementsData[yearStr].pop();
-                    this.saveJudgementsData();
-                }
-            }
-        }
-    }
+    result.title =
+      div.find("h2.doc_title").text().trim() ||
+      "Untitled Judgement";
 
-    // Extract text recursively from an element
-    extractTextWithMetadata(element, $, parentTitle = null) {
-        const result = [];
-        
-        // Get current element's title or id
-        const elementTitle = $(element).attr('title') || $(element).attr('id') || parentTitle || 'unknown';
-        
-        // If this element has direct text
-        const directText = $(element).contents().filter(function() {
-            return this.nodeType === 3; // Text node
-        }).text().trim();
-        
-        if (directText) {
-            result.push({
-                type: elementTitle,
-                content: directText
-            });
-        }
+    div.find("div.covers, h3").remove();
 
-        // Process child elements recursively
-        $(element).children().each((i, child) => {
-            const childTag = $(child).prop('tagName').toLowerCase();
-            
-            // Skip script and style tags
-            if (childTag === 'script' || childTag === 'style') {
-                return;
-            }
-            
-            // For certain tags, we want to process their content
-            const childText = $(child).text().trim();
-            if (childText) {
-                const childTitle = $(child).attr('title') || $(child).attr('id') || elementTitle;
-                
-                // For blockquote, pre, p, div, span - extract their text
-                if (['blockquote', 'pre', 'p', 'div', 'span'].includes(childTag)) {
-                    // Recursively extract from children
-                    const childResults = this.extractTextWithMetadata(child, $, childTitle);
-                    result.push(...childResults);
-                } else {
-                    // For other tags, just get the text
-                    result.push({
-                        type: childTitle,
-                        content: childText
-                    });
-                }
-            }
-        });
+    div.children().each((_, el) => {
+      if ($(el).text().trim()) {
+        result.texts.push(
+          ...this.extractTextWithMetadata(el, $)
+        );
+      }
+    });
 
-        return result;
-    }
+    return result;
+  }
 
-    // Extract judgement content from HTML
-    extractJudgementContent(html, url) {
-        const $ = cheerio.load(html);
-        const result = {
-            title: '',
-            texts: [],
-            url: url,
-            timestamp: new Date().toISOString()
-        };
+  /* ============================================================
+     NETWORK
+  ============================================================ */
 
-        try {
-            // Find the judgements div
-            const judgementsDiv = $('div.judgments');
-            
-            if (judgementsDiv.length === 0) {
-                console.log('No judgements div found');
-                return result;
-            }
-
-            // Extract title from h2.doc_title
-            const titleElement = judgementsDiv.find('h2.doc_title');
-            result.title = titleElement.text().trim() || 'Untitled Judgement';
-
-            // Remove covers div and h3 if present
-            judgementsDiv.find('div.covers, h3').remove();
-
-            // Process all child nodes of judgements div
-            judgementsDiv.children().each((i, child) => {
-                const childTag = $(child).prop('tagName').toLowerCase();
-                
-                // Skip empty elements
-                if ($(child).text().trim().length === 0) {
-                    return;
-                }
-
-                // Extract text with metadata
-                const childTexts = this.extractTextWithMetadata(child, $);
-                if (childTexts.length > 0) {
-                    result.texts.push(...childTexts);
-                }
-            });
-
-            // Also check for pre elements (they might be direct children)
-            judgementsDiv.find('pre').each((i, pre) => {
-                const preText = $(pre).text().trim();
-                if (preText) {
-                    const preTitle = $(pre).attr('title') || $(pre).attr('id') || 'judgement_text';
-                    result.texts.push({
-                        type: preTitle,
-                        content: preText
-                    });
-                }
-            });
-
-        } catch (error) {
-            console.error('Error extracting content:', error.message);
-        }
-
-        return result;
-    }
-
-    // Fetch and process a single judgement
-    async processJudgement(linkInfo) {
-        const { year, page, link, docId } = linkInfo;
-        
-        console.log(`\n[${year}] Processing: ${docId}`);
-        console.log(`URL: ${link}`);
-        
-        try {
-            const response = await this.axiosInstance.get(link);
-            
-            if (response.status === 200) {
-                const judgement = this.extractJudgementContent(response.data, link);
-                
-                // Add year and page info
-                judgement.year = year;
-                judgement.page = page;
-                judgement.docId = docId;
-                
-                console.log(`✓ Extracted: "${judgement.title.substring(0, 60)}..."`);
-                console.log(`  Text sections: ${judgement.texts.length}`);
-                
-                return judgement;
-            } else {
-                console.log(`✗ Failed: HTTP ${response.status}`);
-                return null;
-            }
-        } catch (error) {
-            console.error(`✗ Error: ${error.message}`);
-            
-            // Handle specific errors
-            if (error.response) {
-                console.log(`  HTTP ${error.response.status}: ${error.response.statusText}`);
-            }
-            
-            return null;
-        }
-    }
-
-    // Main scraping function
-    async scrape() {
-        console.log('=== Starting Judgement Scraper ===\n');
-        
-        // Load data
-        if (!this.loadAllLinks()) {
-            console.error('Failed to load links. Exiting.');
-            return;
-        }
-        
-        this.loadProgress();
-        this.loadJudgementsData();
-        this.cleanIncompleteJudgement();
-        
-        // Determine start index
-        let startIndex = 0;
-        if (this.progress.index >= 0) {
-            startIndex = this.progress.index + 1; // Start from next after saved progress
-            console.log(`Resuming from index: ${startIndex}`);
-        }
-        
-        // Process judgements
-        for (let i = startIndex; i < this.allLinks.length; i++) {
-            const linkInfo = this.allLinks[i];
-            const yearStr = linkInfo.year.toString();
-            
-            // Initialize year array if not exists
-            if (!this.judgementsData[yearStr]) {
-                this.judgementsData[yearStr] = [];
-            }
-            
-            // Update progress
-            this.progress.year = linkInfo.year;
-            this.progress.page = linkInfo.page;
-            this.progress.index = i;
-            this.progress.totalProcessed++;
-            this.progress.status = 'processing';
-            
-            console.log(`\n[Progress: ${i + 1}/${this.allLinks.length}]`);
-            
-            // Process the judgement
-            const judgement = await this.processJudgement(linkInfo);
-            
-            if (judgement) {
-                // Add to data
-                this.judgementsData[yearStr].push(judgement);
-                
-                // Save progress every 5 judgements
-                if (this.progress.totalProcessed % 5 === 0) {
-                    this.saveJudgementsData();
-                    this.saveProgress();
-                    console.log(`  Progress saved (${this.progress.totalProcessed} total)`);
-                }
-            }
-            
-            // Delay between requests
-            if (i < this.allLinks.length - 1) {
-                console.log(`  Waiting ${this.delay/1000} seconds...`);
-                await this.delayAsync(this.delay);
-            }
-        }
-        
-        // Final save
-        this.progress.status = 'completed';
-        this.saveJudgementsData();
-        this.saveProgress();
-        
-        console.log('\n=== Scraping Completed ===');
-        console.log(`Total judgements processed: ${this.progress.totalProcessed}`);
-        console.log(`Data saved to: ${this.outputFile}`);
-        
-        // Print summary
-        this.printSummary();
-    }
-
-    // Utility: Delay function
-    delayAsync(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
-    }
-
-    // Print summary statistics
-    printSummary() {
-        console.log('\n=== Summary ===');
-        
-        Object.keys(this.judgementsData).sort().forEach(year => {
-            const count = this.judgementsData[year].length;
-            let totalTexts = 0;
-            
-            this.judgementsData[year].forEach(j => {
-                totalTexts += j.texts.length;
-            });
-            
-            console.log(`${year}: ${count} judgements, ${totalTexts} text sections`);
-        });
-    }
-
-    // Get statistics
-    getStats() {
-        const stats = {
-            totalYears: Object.keys(this.judgementsData).length,
-            totalJudgements: 0,
-            totalTextSections: 0,
-            years: {}
-        };
-        
-        Object.keys(this.judgementsData).forEach(year => {
-            const count = this.judgementsData[year].length;
-            let yearTexts = 0;
-            
-            this.judgementsData[year].forEach(j => {
-                yearTexts += j.texts.length;
-            });
-            
-            stats.totalJudgements += count;
-            stats.totalTextSections += yearTexts;
-            stats.years[year] = {
-                judgements: count,
-                textSections: yearTexts
-            };
-        });
-        
-        return stats;
-    }
-}
-
-// Run the scraper
-async function main() {
-    const scraper = new JudgementScraper();
-    
+  async fetchJudgement(info) {
     try {
-        await scraper.scrape();
-        
-        // Print final statistics
-        const stats = scraper.getStats();
-        console.log('\n=== Final Statistics ===');
-        console.log(`Years: ${stats.totalYears}`);
-        console.log(`Total Judgements: ${stats.totalJudgements}`);
-        console.log(`Total Text Sections: ${stats.totalTextSections}`);
-        
-    } catch (error) {
-        console.error('Fatal error:', error);
+      const res = await this.http.get(info.link);
+      if (res.status !== 200) return null;
+
+      const j = this.extractJudgement(res.data, info.link);
+      j.year = info.year;
+      j.page = info.page;
+      j.docId = info.docId;
+
+      return j;
+    } catch {
+      return null;
     }
+  }
+
+  /* ============================================================
+     MAIN LOOP
+  ============================================================ */
+
+  async scrape() {
+
+    this.loadAllLinks();
+    this.loadProgress();
+
+    let start = this.resume
+      ? this.progress.index + 1
+      : 0;
+
+    console.log(`Starting from index ${start}`);
+
+    for (let i = start; i < this.allLinks.length; i++) {
+
+      const info = this.allLinks[i];
+      const year = String(info.year);
+
+      if (this.currentYear !== year) {
+        if (this.currentYearBuffer.length) {
+          this.saveCurrentYear();
+        }
+        this.loadYear(year);
+      }
+
+      const judgement = await this.fetchJudgement(info);
+
+      this.progress = {
+        year: info.year,
+        page: info.page,
+        index: i,
+        totalProcessed: this.progress.totalProcessed,
+        status: "processing"
+      };
+
+      if (judgement) {
+        this.currentYearBuffer.push(judgement);
+        this.progress.totalProcessed++;
+      }
+
+      if (i % 5 === 0) {
+        this.saveCurrentYear();
+        this.saveProgress();
+      }
+
+      if (i < this.allLinks.length - 1) {
+        await new Promise(r => setTimeout(r, this.delay));
+      }
+    }
+
+    this.progress.status = "completed";
+    this.saveCurrentYear();
+    this.saveProgress();
+
+    console.log("Scraping complete");
+  }
 }
 
-// Handle graceful shutdown
-process.on('SIGINT', async () => {
-    console.log('\n\nScraper interrupted. Saving progress...');
-    process.exit(0);
+/* ============================================================
+   ENTRY
+============================================================ */
+
+async function main() {
+
+  const mode = process.argv.includes("--resume")
+    ? true
+    : false;
+
+  const scraper = new JudgementScraper({ resume: mode });
+  global.scraper = scraper;
+
+  await scraper.scrape();
+}
+
+/* Ctrl+C Safe */
+process.on("SIGINT", () => {
+  console.log("\nSaving before exit...");
+  if (global.scraper) {
+    global.scraper.saveCurrentYear();
+    global.scraper.saveProgress();
+  }
+  process.exit();
 });
 
-// Run if called directly
 if (require.main === module) {
-    main();
+  main();
 }
 
 module.exports = JudgementScraper;
